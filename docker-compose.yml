@@ -21,7 +21,9 @@ services:
       - AGENT_SERVER_IMAGE_REPOSITORY=openhands-dotnet
       - AGENT_SERVER_IMAGE_TAG=latest
       - SANDBOX_BASE_CONTAINER_IMAGE=openhands-dotnet:latest
-      - SANDBOX_USE_HOST_NETWORK=true
+      # SANDBOX_USE_HOST_NETWORK removed: host network causes all sandbox containers
+      # to fight for port 8000, new containers crash (exit 1), and openhands-app
+      # sends wrong session_api_key to the old container → 401 Unauthorized.
     ports:
       - "3001:3000"
     volumes:
