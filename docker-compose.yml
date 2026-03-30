@@ -18,9 +18,10 @@ services:
       - SANDBOX_CONTAINER_URL_PATTERN=http://192.168.31.51:3000/agentproxy/{port}
       # PyInstaller extraction takes ~13s + app init ~4s = ~17s, exceeds default 15s grace
       - SANDBOX_STARTUP_GRACE_SECONDS=120
-      - AGENT_SERVER_IMAGE_REPOSITORY=openhands-dotnet
+      # Kitchen sink image: .NET + Node.js
+      - AGENT_SERVER_IMAGE_REPOSITORY=openhands-sandbox
       - AGENT_SERVER_IMAGE_TAG=latest
-      - SANDBOX_BASE_CONTAINER_IMAGE=openhands-dotnet:latest
+      - SANDBOX_BASE_CONTAINER_IMAGE=openhands-sandbox:latest
       # SANDBOX_USE_HOST_NETWORK removed: host network causes all sandbox containers
       # to fight for port 8000, new containers crash (exit 1), and openhands-app
       # sends wrong session_api_key to the old container → 401 Unauthorized.
