@@ -1,1 +1,3 @@
 .claude/
+docker-compose.override.yml
+nginx.local.conf
