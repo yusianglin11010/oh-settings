@@ -14,11 +14,12 @@ docker images openhands-sandbox:latest --format "{{.Size}}"
 
 echo ""
 echo "=== Testing runtimes in container ==="
-docker run --rm openhands-sandbox:latest bash -c '
+docker run --rm --entrypoint bash openhands-sandbox:latest -c '
 echo "Python: $(python3 --version)"
-echo ".NET:   $(dotnet --version)"
+echo "Go:     $(go version)"
 echo "Node:   $(node --version)"
-echo "npm:    $(npm --version)"
+echo "tsc:    $(tsc --version)"
+echo "docker: $(docker --version)"
 '
 
 echo ""

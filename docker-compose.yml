@@ -5,16 +5,70 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      - SANDBOX_CONTAINER_URL_PATTERN=http://host.docker.internal:{port}
+      # The browser connects DIRECTLY to each conversation's agent-server, and every
+      # sandbox publishes its OWN dynamic host port. To survive Cloudflare (Tunnel +
+      # Access: single hostname, 443 only) we expose them all under one domain via a
+      # path prefix and let the `caddy` sidecar demux it:
+      #     https://<domain>/runtime/<hostport>/...  ->  host.docker.internal:<hostport>
+      # OpenHands replaces {port} with the sandbox's published host port. This is the
+      # same path scheme OpenHands' own hosted infra uses (nginx /runtime/{port}/).
+      # The app itself still reaches sandboxes internally via
+      # SANDBOX_LOCAL_RUNTIME_URL=http://host.docker.internal, so this value is
+      # browser-facing only and only needs to resolve from the browser (via CF).
+      - SANDBOX_CONTAINER_URL_PATTERN=${OH_PUBLIC_ORIGIN:-https://agents.nildev.net}/runtime/{port}
+      # OH_WEB_URL (= app_server `web_url`) is used SERVER-SIDE to build every
+      # sandbox->app callback URL: the default OpenHands MCP server (web_url/mcp/mcp),
+      # webhook-secrets (web_url/api/v1/webhooks/secrets), AND the sandbox CORS
+      # allow-list entry OH_ALLOW_CORS_ORIGINS_0. The sandbox reaches these over the
+      # internal docker host-gateway, so web_url MUST be internally reachable — NOT the
+      # public Cloudflare hostname. If it were the CF URL, the sandbox's call to the
+      # default MCP would hairpin out and hit CF Access, get the login HTML back
+      # ("Unexpected content type: text/html"), and hang MCP tool-listing for 30s ->
+      # sending a message fails with MCPTimeoutError. So point it at the app's
+      # published host port via host.docker.internal (the agent itself talks to the
+      # app, never through CF).
+      - OH_WEB_URL=http://host.docker.internal:3010
+      # Side effect of the above: OH_ALLOW_CORS_ORIGINS_0 is auto-set to web_url, which
+      # is now internal and won't match the browser's real Origin header
+      # (https://agents.nildev.net). Inject the public origin as a SECOND CORS entry
+      # (index _1) into every spawned sandbox via OH_AGENT_SERVER_ENV, so the browser's
+      # same-host WebSocket passes the agent-server's Origin check while web_url stays
+      # internal. (OH_ALLOW_CORS_ORIGINS_* is parsed as an indexed list.)
+      # OH_AGENT_SERVER_ENV injects extra env into EVERY spawned sandbox. We use it for:
+      #   - OH_ALLOW_CORS_ORIGINS_1: the public browser origin (see CORS note above).
+      #   - DOCKER_HOST: point the agent's docker CLI at the isolated Docker-in-Docker
+      #     daemon (the `dind` service) instead of the host socket, so the agent can
+      #     build/run containers WITHOUT root on the host. tcp://host.docker.internal:2375
+      #     resolves to the bridge gateway (172.17.0.1), where dind publishes 2375.
+      - 'OH_AGENT_SERVER_ENV={"OH_ALLOW_CORS_ORIGINS_1":"https://agents.nildev.net","DOCKER_HOST":"tcp://host.docker.internal:2375"}'
       # PyInstaller extraction takes ~13s + app init ~4s = ~17s, exceeds default 15s grace
       - SANDBOX_STARTUP_GRACE_SECONDS=120
-      # Kitchen sink image: .NET + Node.js
+      # Webhook callback port. Each spawned agent-server POSTs its events back to the
+      # app at http://host.docker.internal:<OH_SANDBOX_HOST_PORT>/api/v1/webhooks.
+      # The sandbox reaches us via the host gateway, where ONLY the *published* host
+      # port is listening — so this MUST equal the host side of the ports mapping
+      # below (3010), NOT the container's internal 3000. It defaults to 3000; leaving
+      # it default makes every sandbox fail the health gate with
+      # "Sandbox failed to start within 120s" (the app never receives the ready
+      # webhook), even though the agent-server itself booted fine. NOTE: the env var
+      # is SANDBOX_HOST_PORT (config.py reads os.getenv('SANDBOX_HOST_PORT')); the
+      # OH_SANDBOX_HOST_PORT named in the field docstring is NOT read by this build.
+      - SANDBOX_HOST_PORT=3010
+      # Sandbox image: Python (base) + Go
       - AGENT_SERVER_IMAGE_REPOSITORY=openhands-sandbox
       - AGENT_SERVER_IMAGE_TAG=latest
       - SANDBOX_BASE_CONTAINER_IMAGE=openhands-sandbox:latest
       # SANDBOX_USE_HOST_NETWORK removed: host network causes all sandbox containers
       # to fight for port 8000, new containers crash (exit 1), and openhands-app
       # sends wrong session_api_key to the old container → 401 Unauthorized.
+      #
+      # NOTE: we deliberately do NOT mount the host docker socket into sandboxes any
+      # more. Mounting /var/run/docker.sock used to give the agent EFFECTIVE ROOT ON
+      # THE HOST (it could create a privileged container that bind-mounts / ). Instead
+      # the agent now talks to the isolated `dind` daemon via DOCKER_HOST (set in
+      # OH_AGENT_SERVER_ENV above): it can still build/run containers, but they are
+      # nested inside dind and cannot reach the host. (openhands-app keeps its OWN
+      # socket mount below — it needs the host daemon to spawn the sandboxes.)
     ports:
       - "3010:3000"
     volumes:
@@ -23,3 +77,95 @@ services:
     stdin_open: true
     tty: true
     restart: unless-stopped
+
+  # Docker-in-Docker: an isolated Docker daemon that the agent uses INSTEAD of the
+  # host socket. Containers the agent builds/runs are nested inside this daemon, so a
+  # compromised agent cannot reach the host (no privileged-container / host-bind escape
+  # to root). This is one shared daemon for all sandboxes (cheapest; the host-isolation
+  # goal doesn't need a per-sandbox daemon).
+  #
+  # SECURITY: 2375 is plain HTTP (no TLS) but published ONLY on the docker bridge
+  # gateway 172.17.0.1 — the address sandboxes reach via host.docker.internal — so it
+  # is NOT exposed to the LAN or the internet, only to containers on this host.
+  # An unauthenticated docker daemon on 0.0.0.0 would be root-equivalent to anyone on
+  # the LAN, hence the explicit 172.17.0.1 bind.
+  dind:
+    image: docker:27-dind
+    container_name: oh-dind
+    privileged: true                 # required to run a nested docker daemon
+    environment:
+      - DOCKER_TLS_CERTDIR=          # empty -> dockerd listens on plain tcp 2375
+    ports:
+      - "172.17.0.1:2375:2375"       # bridge-gateway only; NOT 0.0.0.0
+    volumes:
+      - dind_storage:/var/lib/docker # nested image cache (persists; shared by sandboxes)
+    restart: unless-stopped
+
+  # Reverse-proxy sidecar that collapses OpenHands' many per-conversation sandbox
+  # ports onto a single hostname, so Cloudflare Tunnel needs only ONE ingress rule
+  # (agents.nildev.net -> this Caddy) and the CF Access email policy covers the
+  # runtime socket too: it is same-origin, so the browser's CF_Authorization cookie
+  # authorises /runtime/* automatically -> no service token between servers needed.
+  #
+  # Point your cloudflared ingress at this service:
+  #   http://caddy:80          (if cloudflared runs on this compose network), or
+  #   http://localhost:8080    (host-published below).
+  caddy:
+    image: caddy:2-alpine
+    container_name: oh-caddy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+  # GitHub MCP server, run in HTTP (streamable-http) mode as a sidecar.
+  # WHY a sidecar instead of a stdio MCP: in OpenHands v1 the MCP client lives in
+  # the *sandbox* (agent-server) container, not openhands-app. A stdio server's
+  # binary would therefore have to exist inside every sandbox image. Running it
+  # over HTTP keeps the sandbox image slim — sandboxes just open a network
+  # connection to this service (same pattern as the built-in `default` MCP).
+  #
+  # The PAT is NOT set here: http mode authenticates per-request via the
+  # `Authorization: Bearer <token>` header, which OpenHands sends from the
+  # shttp_server's `api_key` field. So the token lives only in OpenHands settings.
+  #
+  # Reuses the statically-linked binary already downloaded to ~/.openhands/mcp,
+  # mounted read-only into a tiny distroless base (which provides CA certs for
+  # the outbound TLS to api.github.com).
+  github-mcp:
+    image: gcr.io/distroless/static-debian12:latest
+    container_name: github-mcp
+    entrypoint: ["/mcp/github-mcp-server", "http", "--port", "8082"]
+    volumes:
+      - ~/.openhands/mcp:/mcp:ro
+    ports:
+      - "8082:8082"
+    restart: unless-stopped
+
+  # Playwright MCP server, also run as an HTTP sidecar (same rationale as github-mcp:
+  # keeps the browser + Node runtime out of the sandbox image). Uses the official
+  # image, which bundles Chromium. Exposes streamable-http at /mcp; no auth.
+  #   --headless    no display in the container
+  #   --no-sandbox  required to run Chromium inside a container
+  playwright-mcp:
+    image: mcr.microsoft.com/playwright/mcp:latest
+    container_name: playwright-mcp
+    init: true
+    entrypoint: ["node"]
+    # --allowed-hosts: Playwright MCP rejects requests whose Host header isn't the
+    # bind host (DNS-rebinding guard). The sandbox reaches us via the LAN IP, so
+    # that host:port must be allowlisted explicitly.
+    command: ["/app/cli.js", "--headless", "--browser", "chromium", "--no-sandbox", "--port", "8931", "--host", "0.0.0.0", "--allowed-hosts", "${OH_PUBLIC_HOST:-192.168.31.53}:8931"]
+    ports:
+      - "8931:8931"
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
+  dind_storage:

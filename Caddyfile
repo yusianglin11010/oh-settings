@@ -1,0 +1,30 @@
+# Reverse proxy that collapses OpenHands v1's many per-conversation sandbox ports
+# onto a single hostname, so Cloudflare Tunnel needs only ONE ingress rule and the
+# CF Access email policy (same-origin cookie) covers the runtime socket too.
+#
+# TLS is terminated at the Cloudflare edge; cloudflared talks plain HTTP to us,
+# so this server is HTTP-only on :80.
+{
+	auto_https off
+	admin off
+}
+
+:80 {
+	# Each conversation's agent-server is published on its own dynamic HOST port.
+	# OpenHands hands the browser a URL of the form:
+	#     https://<domain>/runtime/<hostport>/...
+	# (SANDBOX_CONTAINER_URL_PATTERN=https://<domain>/runtime/{port}).
+	# Strip the /runtime/<hostport> prefix and proxy to that host port. This is the
+	# same path scheme OpenHands' own hosted infra uses (nginx /runtime/{port}/ ->
+	# localhost:{port}). reverse_proxy auto-upgrades WebSockets.
+	@runtime path_regexp rt ^/runtime/(\d+)(?:/(.*))?$
+	handle @runtime {
+		rewrite * /{re.rt.2}
+		reverse_proxy host.docker.internal:{re.rt.1}
+	}
+
+	# Everything else -> the OpenHands app UI + its own socket.io.
+	handle {
+		reverse_proxy openhands:3000
+	}
+}

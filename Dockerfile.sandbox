@@ -2,28 +2,35 @@ FROM ghcr.io/openhands/agent-server:1.12.0-python
 
 USER root
 
-# Install common dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    libicu-dev \
-    ca-certificates \
-    gnupg \
-    && rm -rf /var/lib/apt/lists/*
+# The base image already ships docker CLI, git, curl, ca-certificates and node,
+# so the ONLY thing we add here is Go (absent from the base). No apt layer needed.
+#
+#   - docker:  CLI is in the base; the agent targets the isolated dind daemon via
+#              DOCKER_HOST (set in docker-compose.yml OH_AGENT_SERVER_ENV), NOT the host
+#              socket — so the agent can run containers without root on the host.
+#   - gh CLI:  intentionally NOT installed — GitHub is provided via the
+#              github-mcp-server HTTP sidecar (see docker-compose.yml).
+#   - node:    already in the base; Playwright runs in its own sidecar, so no
+#              browser/Node tooling is baked in here.
+ARG GO_VERSION=1.23.4
 
-# Install .NET 8.0 SDK
-RUN curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir /usr/local/dotnet
+# Install Go from the official tarball (apt's golang lags behind upstream).
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) GO_ARCH=amd64 ;; \
+         arm64) GO_ARCH=arm64 ;; \
+         *) echo "unsupported arch: $ARCH" && exit 1 ;; \
+       esac \
+    && curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
 
-# Install Node.js 20 LTS
-RUN mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+ENV GOROOT=/usr/local/go
+ENV GOPATH=/root/go
+ENV PATH=$PATH:/usr/local/go/bin:/root/go/bin
 
-# Set environment variables
-ENV DOTNET_ROOT=/usr/local/dotnet
-ENV PATH=$PATH:/usr/local/dotnet
+# TypeScript: node/npm are in the base, but tsc isn't. Install it (plus tsx for
+# running .ts files directly) globally so it's available without an on-demand npx pull.
+RUN npm install -g typescript tsx && npm cache clean --force
 
-# Verify installations
-RUN dotnet --version && node --version && npm --version
+RUN go version && node --version && tsc --version
